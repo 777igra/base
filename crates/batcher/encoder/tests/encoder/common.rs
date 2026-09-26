@@ -90,6 +90,41 @@ impl SharedBlob {
     }
 }
 
+/// Two channels retried in one transaction: the first channel's only blob and the second
+/// channel's tail, requeued together once the second channel's two full blobs went out.
+#[derive(Debug)]
+pub struct SharedRetry {
+    /// The two blocks, one per channel.
+    pub blocks: [BaseBlock; 2],
+    /// The two full blobs of the second channel.
+    pub full_blobs: BatchSubmission,
+    /// The transaction carrying the first channel's blob and the second channel's tail.
+    pub retry: BatchSubmission,
+}
+
+impl SharedRetry {
+    /// Feed `encoder` the two blocks, on `max_blobs_per_tx` of 2, and requeue the two
+    /// submissions that come back in one transaction.
+    pub fn encode(encoder: &mut BatchEncoder) -> Self {
+        let first_block = BlockFixture::block(B256::ZERO, 1, 0);
+        let second_block =
+            BlockFixture::block(first_block.header.hash_slow(), 2, THREE_BLOB_PAYLOAD);
+        encoder.add_block(first_block.clone()).unwrap();
+        let first = encoder.encode_and_drain().unwrap();
+        encoder.add_block(second_block.clone()).unwrap();
+        let mut second = encoder.encode_and_drain().unwrap();
+        assert_eq!(second.len(), 2, "two full blobs, then the tail");
+        let tail = second.pop().expect("the tail");
+        let full_blobs = second.pop().expect("the full blobs");
+
+        encoder.requeue(first[0].id);
+        encoder.requeue(tail.id);
+        let retry = encoder.next_submission().expect("the retry");
+        assert_eq!(retry.blob_count(), 2, "one transaction carries both channels");
+        Self { blocks: [first_block, second_block], full_blobs, retry }
+    }
+}
+
 /// An open channel that has handed out its first submission: blocks of
 /// [`MULTI_BLOB_PAYLOAD`] fed one at a time until the encoder releases output.
 #[derive(Debug)]
