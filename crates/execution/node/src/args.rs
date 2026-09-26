@@ -340,8 +340,9 @@ pub const DEFAULT_WITNESS_CACHE_RETENTION_BLOCKS: u64 = 3_600;
 /// Default number of witnesses the witness cache builds concurrently.
 pub const DEFAULT_WITNESS_CACHE_BUILDER_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
-/// Directory under the proofs history storage path used when no witness cache path is set.
-pub const DEFAULT_WITNESS_CACHE_DIR: &str = "witness-cache";
+/// Suffix of the directory next to the proofs history storage path used when no witness cache
+/// path is set. The cache is kept out of the storage directory, which the proofs database owns.
+pub const DEFAULT_WITNESS_CACHE_SUFFIX: &str = "-witness-cache";
 
 /// Options for the prebuilt `debug_executePayload` witness cache of proofs history.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -354,8 +355,7 @@ pub struct ProofsHistoryWitnessCacheArgs {
     )]
     pub enabled: bool,
 
-    /// Witness cache directory. Defaults to `witness-cache` under the proofs history storage
-    /// path.
+    /// Witness cache directory. Defaults to `<proofs history storage path>-witness-cache`.
     #[arg(
         long = "proofs-history.witness-cache.path",
         visible_alias = "proofs.witness-cache.path",
@@ -409,7 +409,11 @@ impl ProofsHistoryWitnessCacheArgs {
     /// `storage_path`.
     pub fn config(&self, storage_path: &Path) -> Option<WitnessCacheConfig> {
         self.enabled.then(|| WitnessCacheConfig {
-            path: self.path.clone().unwrap_or_else(|| storage_path.join(DEFAULT_WITNESS_CACHE_DIR)),
+            path: self.path.clone().unwrap_or_else(|| {
+                let mut name = storage_path.file_name().unwrap_or_default().to_os_string();
+                name.push(DEFAULT_WITNESS_CACHE_SUFFIX);
+                storage_path.with_file_name(name)
+            }),
             retention_blocks: self.retention_blocks,
             build_lag: self.build_lag,
             builder_concurrency: self.builder_concurrency,
@@ -975,7 +979,7 @@ mod tests {
         assert_eq!(
             args.proofs_history_witness_cache.config(Path::new("/proofs")),
             Some(WitnessCacheConfig {
-                path: PathBuf::from("/proofs/witness-cache"),
+                path: PathBuf::from("/proofs-witness-cache"),
                 retention_blocks: 3_600,
                 build_lag: 0,
                 builder_concurrency: NonZeroUsize::new(2).unwrap(),
