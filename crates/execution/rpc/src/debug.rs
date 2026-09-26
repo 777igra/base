@@ -357,7 +357,7 @@ where
             .inner
             .provider
             .block_by_number(block_number)?
-            .ok_or(ProviderError::BlockBodyIndicesNotFound(block_number))?;
+            .ok_or(ProviderError::HeaderNotFound(block_number.into()))?;
         let parent_hash = block.header().parent_hash();
         let attributes =
             CanonicalPayloadAttributes::from_block(&block, &*self.inner.provider.chain_spec())?;
