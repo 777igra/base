@@ -312,10 +312,9 @@ where
 
             let Some(target) = latest.checked_sub(config.build_lag) else { continue };
             // Block `N` is built on the state of block `N - 1`, which must be in proofs storage.
-            let start = next_block
-                .unwrap_or(target)
-                .max(earliest + 1)
-                .max(target.saturating_sub(WITNESS_CACHE_MAX_PENDING_BUILDS as u64));
+            // On a cold start, backfill the most recent blocks instead of only the tip.
+            let window_start = target.saturating_sub(WITNESS_CACHE_MAX_PENDING_BUILDS as u64 - 1);
+            let start = next_block.unwrap_or(window_start).max(earliest + 1).max(window_start);
             pending.extend(start..=target);
             next_block = Some(next_block.map_or(target + 1, |next| next.max(target + 1)));
             while pending.len() > WITNESS_CACHE_MAX_PENDING_BUILDS {
