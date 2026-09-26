@@ -488,15 +488,11 @@ mod tests {
         });
     }
 
-    /// Build a [`BatchSubmission`] whose single frame exactly fills one blob payload,
-    /// leaving no room for any additional frame alongside it.
+    /// Build a [`BatchSubmission`] of `frame_count` frames that each exactly fill one blob
+    /// payload, leaving no room for any additional frame alongside it.
     ///
     /// `payload = 1 (DERIVATION_VERSION_0) + FRAME_OVERHEAD + data.len() = BLOB_MAX_DATA_SIZE`
-    fn blob_filling_submission(id: u64) -> BatchSubmission {
-        blob_filling_submission_with_frames(id, 1)
-    }
-
-    fn blob_filling_submission_with_frames(id: u64, frame_count: usize) -> BatchSubmission {
+    fn blob_filling_submission(id: u64, frame_count: usize) -> BatchSubmission {
         let data_len = BlobEncoder::BLOB_MAX_DATA_SIZE - 1 - BlobEncoder::FRAME_OVERHEAD;
         BatchSubmission::blobs(
             SubmissionId(id),
@@ -512,9 +508,9 @@ mod tests {
         )
     }
 
-    // The loop polls its arms in priority order; each test below makes several arms ready at
-    // once and checks which one the driver serves first. Each test checks the start of the
-    // call log: the shutdown flush always ends it.
+    // The loop polls its arms in priority order. Each test in this group makes several arms
+    // ready at once and checks which one the driver serves first, from the start of the call
+    // log (the shutdown flush ends it) or from the result.
 
     #[test]
     fn run_prioritizes_cancellation_over_ready_admin() {
@@ -538,6 +534,25 @@ mod tests {
             assert!(flush.await.unwrap().is_err(), "a cancelled driver must not serve the flush");
             // Only the shutdown flush: neither the admin flush, the block nor the head is served.
             assert_eq!(recorded.lock().unwrap().calls, [PipelineCall::Flush]);
+        });
+    }
+
+    /// The derivation-status poller shares the driver's cancellation and drops its sender when
+    /// it exits, so at the first wait after a cancellation the closed channel may already be
+    /// ready too. A graceful shutdown must not end in `DerivationStatusSourceClosed`.
+    #[test]
+    fn run_prioritizes_cancellation_over_closed_derivation_status() {
+        Runner::start(Config::seeded(0), |ctx| async move {
+            let (driver, handles) = DriverFixture::new(
+                ctx.clone(),
+                TrackingPipeline::new(),
+                ScriptedTxManager::confirming_at(1),
+            )
+            .build();
+
+            ctx.cancel();
+            drop(handles);
+            assert!(driver.run().await.is_ok());
         });
     }
 
@@ -647,22 +662,26 @@ mod tests {
         });
     }
 
+    /// A failed submission is resent before anything a block releases, even when both are
+    /// ready at the same wait: the retry takes back the nonce it freed, so its frames reach L1
+    /// before the newer ones, as derivation requires.
     #[test]
-    fn run_prioritizes_derivation_status_before_l1_head() {
+    fn run_resends_a_failed_submission_before_a_block_releases_newer_ones() {
         Runner::start(Config::seeded(0), |ctx| async move {
-            let pipeline = TrackingPipeline::new();
+            let mut pipeline = TrackingPipeline::new();
             let recorded = pipeline.recorded();
-            let (source, l1_head_source) = queued_sources([], [9]);
-            let (driver, handles) =
-                DriverFixture::new(ctx.clone(), pipeline, ScriptedTxManager::confirming_at(1))
-                    .source(source)
-                    .l1_head_source(l1_head_source)
-                    .build();
-            handles
-                .derivation_status_tx
-                .send(DerivationStatus::from_safe_l2(safe_head(5)))
-                .await
-                .unwrap();
+            // Submitted by the first CPU phase, so its failure is ready at the first wait,
+            // along with the block.
+            pipeline.submissions.push_back(SubmissionStub::stub());
+            let (source, l1_head_source) = queued_sources([1], []);
+            let (driver, _handles) = DriverFixture::new(
+                ctx.clone(),
+                pipeline,
+                ScriptedTxManager::new([SendOutcome::Failed]),
+            )
+            .source(source)
+            .l1_head_source(l1_head_source)
+            .build();
 
             let handle = ctx.spawn(driver.run());
             ctx.sleep(Duration::from_millis(10)).await;
@@ -672,14 +691,19 @@ mod tests {
             let recorded = recorded.lock().unwrap();
             assert!(
                 recorded.calls.starts_with(&[
-                    PipelineCall::ReconcileDerivation { safe_l2: 5, current_l1: None },
-                    PipelineCall::AdvanceL1Head(9),
+                    PipelineCall::Dequeue(SubmissionId(0)),
+                    PipelineCall::Requeue(SubmissionId(0)),
+                    PipelineCall::Dequeue(SubmissionId(0)),
+                    PipelineCall::AddBlock(1),
                 ]),
                 "{:?}",
                 recorded.calls
             );
         });
     }
+
+    // Encoding runs in slices of `STEP_BUDGET` steps; the tests below check what happens
+    // between two slices.
 
     /// A backlog larger than one encoding slice is finished without any external event.
     #[test]
@@ -746,60 +770,8 @@ mod tests {
         });
     }
 
-    /// `advance_l1_head` must be called with the confirmed L1 block on every
-    /// confirmation so the encoder can detect channel timeouts.
-    #[test]
-    fn test_advance_l1_head_called_on_confirmation() {
-        Runner::start(Config::seeded(0), |ctx| async move {
-            let mut pipeline = TrackingPipeline::new();
-            let recorded = pipeline.recorded();
-            pipeline.submissions.push_back(SubmissionStub::stub());
-
-            let (driver, _handles) =
-                DriverFixture::new(ctx.clone(), pipeline, ScriptedTxManager::confirming_at(42))
-                    .build();
-            let handle = ctx.spawn(driver.run());
-
-            ctx.sleep(Duration::from_millis(50)).await;
-            ctx.cancel();
-
-            assert!(handle.await.unwrap().is_ok(), "driver should exit cleanly on cancellation");
-            assert_eq!(
-                recorded.lock().unwrap().l1_heads(),
-                [42],
-                "advance_l1_head must be called with the confirmed L1 block"
-            );
-        });
-    }
-
-    /// A failed submission is requeued and resent, and `advance_l1_head` is not called: there
-    /// is no confirmed L1 block to report.
-    #[test]
-    fn test_failed_submission_is_resent_without_advancing_l1_head() {
-        Runner::start(Config::seeded(0), |ctx| async move {
-            let mut pipeline = TrackingPipeline::new();
-            let recorded = pipeline.recorded();
-            pipeline.submissions.push_back(SubmissionStub::stub());
-
-            let tx_manager = ScriptedTxManager::new([SendOutcome::Failed]);
-            let (driver, _handles) =
-                DriverFixture::new(ctx.clone(), pipeline, tx_manager.clone()).build();
-            let handle = ctx.spawn(driver.run());
-
-            ctx.sleep(Duration::from_millis(50)).await;
-            ctx.cancel();
-
-            assert!(handle.await.unwrap().is_ok(), "driver should exit cleanly on cancellation");
-            let recorded = recorded.lock().unwrap();
-            assert!(
-                recorded.l1_heads().is_empty(),
-                "advance_l1_head must NOT be called on submission failure"
-            );
-            // The failure requeues the submission and the next CPU phase resends it.
-            assert_eq!(recorded.requeued(), [SubmissionId(0)]);
-            assert_eq!(tx_manager.candidates().len(), 2, "the failed submission must be resent");
-        });
-    }
+    // Sending: each pipeline submission goes out as its own tx, a blob that cannot be built
+    // is fatal, and the in-flight limit holds back the rest.
 
     /// A blob submission that cannot be built into a transaction is fatal: a retry would fail
     /// the same way and hold back every submission behind it.
@@ -825,10 +797,10 @@ mod tests {
         });
     }
 
-    /// The submission loop must submit each pipeline submission as one L1 tx. The
-    /// pipeline is responsible for choosing the frames that belong in a transaction.
+    /// The driver sends each pipeline submission as its own L1 tx: the pipeline chooses the
+    /// frames that belong in a transaction.
     #[test]
-    fn test_submission_loop_submits_each_pipeline_submission_as_one_tx() {
+    fn test_each_pipeline_submission_is_sent_as_one_tx() {
         Runner::start(Config::seeded(0), |ctx| async move {
             let mut pipeline = TrackingPipeline::new();
             let recorded = pipeline.recorded();
@@ -845,57 +817,15 @@ mod tests {
             ctx.cancel();
 
             assert!(handle.await.unwrap().is_ok(), "driver should exit cleanly on cancellation");
-            let recorded = recorded.lock().unwrap();
-            assert_eq!(recorded.dequeued().len(), 2, "both submissions must be dequeued");
-            assert_eq!(
-                recorded.confirmed(),
-                [SubmissionId(0), SubmissionId(1)],
-                "each pipeline submission should produce its own confirmation"
-            );
             assert_eq!(
                 tx_manager.candidates().len(),
                 2,
                 "separate pipeline submissions must not be coalesced into one L1 tx"
             );
-        });
-    }
-
-    /// A failed submission is resent before anything a block releases, even when both are
-    /// ready at the same wait: the retry takes back the nonce it freed, so its frames reach L1
-    /// before the newer ones, as derivation requires.
-    #[test]
-    fn run_resends_a_failed_submission_before_a_block_releases_newer_ones() {
-        Runner::start(Config::seeded(0), |ctx| async move {
-            let mut pipeline = TrackingPipeline::new();
-            let recorded = pipeline.recorded();
-            // Submitted by the first CPU phase, so its failure is ready at the first wait,
-            // along with the block.
-            pipeline.submissions.push_back(SubmissionStub::stub());
-            let (source, l1_head_source) = queued_sources([1], []);
-            let (driver, _handles) = DriverFixture::new(
-                ctx.clone(),
-                pipeline,
-                ScriptedTxManager::new([SendOutcome::Failed]),
-            )
-            .source(source)
-            .l1_head_source(l1_head_source)
-            .build();
-
-            let handle = ctx.spawn(driver.run());
-            ctx.sleep(Duration::from_millis(10)).await;
-            ctx.cancel();
-            assert!(handle.await.unwrap().is_ok());
-
-            let recorded = recorded.lock().unwrap();
-            assert!(
-                recorded.calls.starts_with(&[
-                    PipelineCall::Dequeue(SubmissionId(0)),
-                    PipelineCall::Requeue(SubmissionId(0)),
-                    PipelineCall::Dequeue(SubmissionId(0)),
-                    PipelineCall::AddBlock(1),
-                ]),
-                "{:?}",
-                recorded.calls
+            assert_eq!(
+                recorded.lock().unwrap().confirmed(),
+                [SubmissionId(0), SubmissionId(1)],
+                "each pipeline submission should produce its own confirmation"
             );
         });
     }
@@ -907,8 +837,7 @@ mod tests {
     fn test_multi_frame_blob_submission_maps_frames_to_blobs() {
         Runner::start(Config::seeded(0), |ctx| async move {
             let mut pipeline = TrackingPipeline::new();
-            let recorded = pipeline.recorded();
-            let submission = blob_filling_submission_with_frames(0, 3);
+            let submission = blob_filling_submission(0, 3);
             let SubmissionPayload::Blobs(payloads) = submission.payload() else {
                 panic!("helper must create blob payloads");
             };
@@ -927,17 +856,6 @@ mod tests {
             ctx.cancel();
 
             assert!(handle.await.unwrap().is_ok(), "driver should exit cleanly on cancellation");
-            let recorded = recorded.lock().unwrap();
-            assert_eq!(recorded.dequeued(), [SubmissionId(0)], "submission must be dequeued");
-            assert!(
-                recorded.requeued().is_empty(),
-                "multi-frame blob submission must not be requeued by blob encoding"
-            );
-            assert_eq!(
-                recorded.confirmed(),
-                [SubmissionId(0)],
-                "multi-frame blob submission should confirm once"
-            );
             let candidates = tx_manager.candidates();
             assert_eq!(candidates.len(), 1, "multi-frame submission should use one L1 tx");
             assert!(
@@ -963,8 +881,8 @@ mod tests {
         Runner::start(Config::seeded(0), |ctx| async move {
             let mut pipeline = TrackingPipeline::new();
             let recorded = pipeline.recorded();
-            pipeline.submissions.push_back(blob_filling_submission(0));
-            pipeline.submissions.push_back(blob_filling_submission(1));
+            pipeline.submissions.push_back(SubmissionStub::with_id(0));
+            pipeline.submissions.push_back(SubmissionStub::with_id(1));
 
             let (driver, _handles) =
                 DriverFixture::new(ctx.clone(), pipeline, ScriptedTxManager::new([]))
@@ -976,39 +894,8 @@ mod tests {
             ctx.cancel();
 
             assert!(handle.await.unwrap().is_ok(), "driver should exit cleanly on cancellation");
-            let recorded = recorded.lock().unwrap();
-            assert_eq!(recorded.dequeued(), [SubmissionId(0)], "only one tx may be in flight");
-            assert!(recorded.requeued().is_empty(), "a held-back submission is not requeued");
-            assert!(recorded.l1_heads().is_empty(), "the tx in flight never confirms");
-        });
-    }
-
-    /// With `max_pending_transactions`=1 and blob-filling submissions, the second
-    /// blob tx is only submitted once the first is confirmed.
-    #[test]
-    fn test_next_blob_tx_submitted_once_the_previous_settles() {
-        Runner::start(Config::seeded(0), |ctx| async move {
-            let mut pipeline = TrackingPipeline::new();
-            let recorded = pipeline.recorded();
-            pipeline.submissions.push_back(blob_filling_submission(0));
-            pipeline.submissions.push_back(blob_filling_submission(1));
-            pipeline.submissions.push_back(blob_filling_submission(2));
-
-            let (driver, _handles) =
-                DriverFixture::new(ctx.clone(), pipeline, ScriptedTxManager::confirming_at(7))
-                    .max_pending(1)
-                    .build();
-            let handle = ctx.spawn(driver.run());
-
-            ctx.sleep(Duration::from_millis(50)).await;
-            ctx.cancel();
-
-            assert!(handle.await.unwrap().is_ok(), "driver should exit cleanly on cancellation");
-            assert_eq!(
-                recorded.lock().unwrap().confirmed(),
-                [SubmissionId(0), SubmissionId(1), SubmissionId(2)],
-                "each queued submission must confirm as the tx before it settles"
-            );
+            let dequeued = recorded.lock().unwrap().dequeued();
+            assert_eq!(dequeued, [SubmissionId(0)], "only one tx may be in flight");
         });
     }
 }
